@@ -192,6 +192,81 @@ $('clearBtn').onclick = () => {
 
 let lastOrganized = null;
 
+// --- モデルは固定しない: 使えるモデルを一覧から探し、ダメなら次へ ---
+const API = 'https://generativelanguage.googleapis.com/v1beta/';
+const MODEL_STORAGE = 'memo_seiri_gemini_model';
+
+async function listModels(apiKey) {
+  const res = await fetch(API + 'models?pageSize=200&key=' + encodeURIComponent(apiKey));
+  if (!res.ok) throw new Error('モデル一覧の取得に失敗: ' + res.status);
+  const data = await res.json();
+  const skip = /(lite|image|tts|audio|live|embed|robotics|computer|exp|learnlm|gemma|aqa|imagen|veo)/i;
+  const list = (data.models || [])
+    .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map(m => m.name.replace(/^models\//, ''))
+    .filter(n => /^gemini-\d/.test(n) && /flash/.test(n) && !skip.test(n))
+    .map(n => ({ name: n, ver: parseFloat((n.match(/^gemini-(\d+(?:\.\d+)?)/) || [0, 0])[1]), pre: /preview/.test(n) }));
+  // 正式版を優先し、その中でバージョンが新しいものから
+  list.sort((a, b) => (a.pre - b.pre) || (b.ver - a.ver) || (a.name.length - b.name.length));
+  return list.map(x => x.name);
+}
+
+async function callGemini(apiKey, model, prompt) {
+  let res;
+  try {
+    res = await fetch(API + 'models/' + model + ':generateContent?key=' + encodeURIComponent(apiKey), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: 'application/json' }
+      })
+    });
+  } catch (netErr) {
+    // 応答そのものが返らない＝モデルの問題ではなく、通信が遮られている
+    const e = new Error('Geminiに通信できませんでした。ネットワーク、広告ブロック、VPN、または今開いている画面の制限が考えられます。公開したページのURLをブラウザの新しいタブで開いて試してください。（' + netErr.message + '）');
+    e.network = true;
+    throw e;
+  }
+  if (!res.ok) {
+    const t = await res.text();
+    const e = new Error('APIエラー: ' + res.status + ' ' + t.slice(0, 200));
+    e.status = res.status;
+    e.body = t;
+    throw e;
+  }
+  const data = await res.json();
+  const raw = (data?.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
+  if (!raw) throw new Error('AIから空の応答が返りました');
+  return raw;
+}
+
+async function generateWithFallback(apiKey, prompt) {
+  const candidates = [];
+  const saved = localStorage.getItem(MODEL_STORAGE);
+  if (saved) candidates.push(saved);
+  try {
+    for (const n of await listModels(apiKey)) if (!candidates.includes(n)) candidates.push(n);
+  } catch (e) { console.warn(e); }
+  if (!candidates.length) candidates.push('gemini-2.5-flash', 'gemini-3.5-flash');
+  let lastErr;
+  for (const model of candidates.slice(0, 5)) {
+    try {
+      $('status').textContent = 'AIが整理しています…（' + model + '）';
+      const raw = await callGemini(apiKey, model, prompt);
+      localStorage.setItem(MODEL_STORAGE, model);
+      return raw;
+    } catch (e) {
+      lastErr = e;
+      console.warn(model, e);
+      // キーそのものが無効なら、他のモデルを試しても無駄
+      if (e.network || e.status === 401 || e.status === 403 || (e.status === 400 && /API key/i.test(e.body || ''))) break;
+    }
+  }
+  if (!(lastErr && lastErr.network)) localStorage.removeItem(MODEL_STORAGE);
+  throw lastErr || new Error('使えるモデルが見つかりませんでした');
+}
+
 $('organizeBtn').onclick = async () => {
   const text = $('input').value.trim();
   if (!text) {
@@ -234,24 +309,7 @@ $('organizeBtn').onclick = async () => {
 ${text}`;
 
   try {
-    const response = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + encodeURIComponent(apiKey),
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }]
-        })
-      }
-    );
-
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error('APIエラー: ' + response.status + ' ' + errText.slice(0,200));
-    }
-
-    const data = await response.json();
-    let raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    let raw = await generateWithFallback(apiKey, prompt);
     raw = raw.trim().replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
 
     const parsed = JSON.parse(raw);
